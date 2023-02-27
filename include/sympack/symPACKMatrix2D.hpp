@@ -360,7 +360,12 @@ namespace symPACK{
           std::shared_ptr<blockCellBase_t> extra_data;
 #ifdef CUDA_MODE
           upcxx::global_ptr<blockCellBase_t, upcxx::memory_kind::cuda_device> d_extra_data;
-#endif          
+#endif      
+#ifdef CUDA_MODE
+          upcxx::global_ptr<char, upcxx::memory_kind::cuda_device> d_remote_gptr;
+          upcxx::global_ptr<char, upcxx::memory_kind::cuda_device> d_landing_zone;
+          bool alloc_d_landing_zone; //True if d_landing_zone has been allocated on device
+#endif              
 
           incoming_data_t():transfered(false),size(0),extra_data(nullptr),landing_zone(nullptr), alloc_d_landing_zone(false) {
             on_fetch_future = on_fetch.get_future();
@@ -368,11 +373,6 @@ namespace symPACK{
 
           bool transfered;
           upcxx::global_ptr<char> remote_gptr;
-#ifdef CUDA_MODE
-          upcxx::global_ptr<char, upcxx::memory_kind::cuda_device> d_remote_gptr;
-          upcxx::global_ptr<char, upcxx::memory_kind::cuda_device> d_landing_zone;
-          bool alloc_d_landing_zone; //True if d_landing_zone has been allocated on device
-#endif          
           size_t size;
           char * landing_zone;
 
@@ -393,10 +393,18 @@ namespace symPACK{
               upcxx::rget(remote_gptr,landing_zone,size).then([this]() {
                   on_fetch.fulfill_result(this);
                   return;});
+              std::string debug_land_zone;
+              for (int i=0; i<size; i++)
+                debug_land_zone += landing_zone[i];
+              logfileptr->OFS()<<debug_land_zone<<std::endl;
+              debug_land_zone.clear();
 #ifdef CUDA_MODE
               upcxx::copy(d_landing_zone, d_remote_gptr, size).then([this]() {
                   on_fetch.fulfill_result(this);
                   return;});
+              logfileptr->OFS()<<"DEVICE BUFFER"<<std::endl;
+              upcxx::copy(debug_land_zone, d_landing_zone, size).wait();
+              logfileptr->OFS()<<debug_land_zone<<std::endl;
 #endif                  
 #else
               std::fill(landing_zone,landing_zone+size,'0');
@@ -6870,7 +6878,6 @@ namespace symPACK{
           {
             while (local_task_cnt>0) {
               if (!ready_tasks.empty()) {
-                //upcxx::progress(upcxx::progress_level::internal);
                 auto ptask = top_ready();
                 pop_ready();
                 ptask->execute(); 
@@ -6886,10 +6893,10 @@ namespace symPACK{
                   msg->allocate();
                   msg->fetch().then([this,ptask](incoming_data_t<ttask_t,meta_t> * pmsg) {
                       //fulfill promise by one, when this reaches 0, ptask is moved to scheduler.ready_tasks
+                      
                       ptask->satisfy_dep(1,*this);
                       });
                 } 
-                //upcxx::progress(upcxx::progress_level::internal);
               }
             }
             upcxx::progress();
