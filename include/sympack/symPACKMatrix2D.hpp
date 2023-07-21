@@ -990,6 +990,19 @@ namespace symPACK{
 
 
 #ifdef CUDA_MODE
+	
+	void dump_nnz_d(std::string prelude) {
+		progressptr->OFS()<<prelude<<std::endl;
+		dev_ptr tmp = symPACK::gpu_allocator.allocate<T>(_nnz);
+		upcxx::copy(_nzval, tmp, _nnz).wait();
+		for (int i=0; i<_nnz; i++) {
+			progressptr->OFS()<<tmp[i]<<",";
+		}
+		progressptr->OFS()<<std::endl;
+		symPACK::gpu_allocator.deallocate(tmp);
+	}
+
+
 	bool gpu_alloc_check(std::vector<size_t> bytes) {
 		
 		/* Don't do it if GPU hasn't enough space */
@@ -1020,6 +1033,7 @@ namespace symPACK{
           auto snode_size = std::get<0>(_dims);
           auto diag_nzval = _nzval;
 	  logfileptr->OFS()<<"Factorize"<<std::endl;
+	  logfileptr->OFS()<<i<<","<<j<<std::endl;
           try {
 #ifdef CUDA_MODE
 	    if (gpu_block) {
@@ -1053,9 +1067,10 @@ namespace symPACK{
           auto snode_size = std::get<0>(_dims);
           auto diag_nzval = diag->_nzval;
           auto nzblk_nzval = _nzval;
+	  logfileptr->OFS()<<"TRSM"<<std::endl;
+	  logfileptr->OFS()<<this->i<<","<<this->j<<std::endl;
 #ifdef CUDA_MODE
 	  if (diag->gpu_block || gpu_block) {
-	  	logfileptr->OFS()<<"TRSM"<<std::endl;
 	  	dev_ptr d_diag_nzval, d_nzblk_nzval;
 		if (gpu_block) {
 			d_nzblk_nzval = _d_nzval;
@@ -1187,38 +1202,46 @@ namespace symPACK{
               }
             }
             int ldbuf = tgt_width;
+#ifdef CUDA_MODE
+	    dev_ptr d_pivot_nzval, d_facing_nzval, d_buf = nullptr;
+	    bool use_gpu_tmp = false;
+#endif
             if (in_place) {
               buf = tgt + tgt_offset;
               beta = T(1);
               ldbuf = tgt_snode_size;
+#ifdef CUDA_MODE
+	      if (this->gpu_block) {
+	      	d_buf = this->_d_nzval + tgt_offset;	     
+	      } else {
+	      	d_buf = symPACK::gpu_allocator.allocate<T>(this->_nnz - tgt_offset);
+		upcxx::copy(buf, d_buf, this->_nnz - tgt_offset).wait();
+	      }
+#endif	      
             }
             else {
               //Compute the update in a temporary buffer
 	      tmpBuffers.tmpBuf.resize(tgt_width*src_nrows + src_snode_size*tgt_width);
               buf = &tmpBuffers.tmpBuf[0];
-            }
 #ifdef CUDA_MODE
-	    dev_ptr d_pivot_nzval, d_facing_nzval, d_buf = nullptr;
+	      d_buf = symPACK::gpu_allocator.allocate<T>(tgt_width*src_nrows + src_snode_size*tgt_width);
+	      if (d_buf==nullptr) logfileptr->OFS()<<"OUT OF GPU SPACE"<<std::endl;
 #endif
+            }
             if ( in_place && this->i == this->j ) {
               bassert(src_nrows==tgt_width);
               SYMPACK_TIMER_SPECIAL_START(UPDATE_SNODE_SYRK);
+	        logfileptr->OFS()<<"SYRK"<<std::endl; 
+		logfileptr->OFS()<<this->i<<","<<this->j<<std::endl;
 #ifdef CUDA_MODE
 	      size_t buf_size = tgt_width*ldbuf;
 
 	      if (this->gpu_block || pivot.gpu_block) {
-	        logfileptr->OFS()<<"SYRK"<<std::endl; 
 		if (pivot.gpu_block) {
 			d_pivot_nzval = pivot._d_nzval;
 		} else {
 			d_pivot_nzval = symPACK::gpu_allocator.allocate<T>(tgt_width * src_snode_size);
 			upcxx::copy(pivot._nzval, d_pivot_nzval, tgt_width*src_snode_size).wait();
-		}
-		if (this->gpu_block) {
-			d_buf = this->_d_nzval + tgt_offset;
-		} else {
-			d_buf = symPACK::gpu_allocator.allocate<T>(buf_size);
-			upcxx::copy(buf, d_buf, buf_size).wait();
 		}
 		
 		cublas::cublas_syrk_wrapper2(CUBLAS_FILL_MODE_UPPER,CUBLAS_OP_T,tgt_width, src_snode_size,
@@ -1249,16 +1272,19 @@ namespace symPACK{
             else {
               //everything is in row-major
               SYMPACK_TIMER_SPECIAL_START(UPDATE_SNODE_GEMM);
+		logfileptr->OFS()<<"GEMM "<<in_place<<std::endl;
+		logfileptr->OFS()<<this->i<<","<<this->j<<std::endl;
 #ifdef CUDA_MODE
 	      bool use_gpu_buf = false;
-	      size_t buf_size; 
-	      if (in_place) buf_size = ldbuf * tgt_width;
-	      else buf_size = ldbuf*src_nrows;
-	      if ((!in_place && buf_size*sizeof(T) > BLOCK_GPU_LIMIT) || (in_place && this->gpu_block)) {
+	      size_t buf_size = ldbuf * src_nrows; 
+	      
+	      /* Buf is on the GPU, but it may or may not be temporary. Either is fine */
+	      if ((!in_place && buf_size*sizeof(T) > BLOCK_GPU_LIMIT && d_buf!=nullptr) || (in_place && this->gpu_block)) {
 	      	use_gpu_buf = true;
 	      }
+
 	      if (use_gpu_buf || facing.gpu_block || pivot.gpu_block) {
-		logfileptr->OFS()<<"GEMM"<<std::endl;
+	      	use_gpu_tmp = true;
 		if (pivot.gpu_block) {
 			d_pivot_nzval = pivot._d_nzval;
 		} else {
@@ -1273,18 +1299,6 @@ namespace symPACK{
 			upcxx::copy(facing._nzval, d_facing_nzval, src_nrows*src_snode_size).wait();
 		}
 
-		if (in_place && this->gpu_block) {
-			d_buf = this->_d_nzval + tgt_offset;
-		} else if (in_place) {
-			d_buf = symPACK::gpu_allocator.allocate<T>(buf_size);
-			upcxx::copy(buf, d_buf, buf_size).wait();
-		} else {
-			buf_size = tmpBuffers.tmpBuf.size();
-			d_buf = symPACK::gpu_allocator.allocate<T>(buf_size);
-			upcxx::copy(buf, d_buf, buf_size).wait();
-		}
-		
-
 		cublas::cublas_gemm_wrapper2(CUBLAS_OP_T, CUBLAS_OP_N,
 						  tgt_width, src_nrows, src_snode_size,
 						  T(-1.0), 
@@ -1293,10 +1307,10 @@ namespace symPACK{
 						  symPACK::gpu_allocator.local(d_buf), ldbuf);
 		CUDA_ERROR_CHECK(cudaDeviceSynchronize());
 		
-		if (!this->gpu_block) {
-			upcxx::copy(d_buf, buf, buf_size).wait();
-			symPACK::gpu_allocator.deallocate(d_buf);
-		}
+		//if (!use_gpu_buf) {
+		//	upcxx::copy(d_buf, buf, buf_size).wait();
+		//	symPACK::gpu_allocator.deallocate(d_buf);
+		//}
 		
 		if (!pivot.gpu_block) {
 			symPACK::gpu_allocator.deallocate(d_pivot_nzval);
@@ -1379,29 +1393,50 @@ namespace symPACK{
                   T * A = &buf[rowidx*tgt_width];
                   T * B = &tgt[tmpBuffers.src_to_tgt_offset[rowidx] + tgt_offset];                 
 #ifdef CUDA_MODE
-		  if (this->gpu_block || d_buf!=nullptr) {
-		  	dev_ptr d_A, d_B;
-			if (d_buf==nullptr) {
-				d_buf = symPACK::gpu_allocator.allocate<T>(tmpBuffers.tmpBuf.size());
-				upcxx::copy(buf, d_buf, tmpBuffers.tmpBuf.size()).wait();
+		  dev_ptr d_A, d_B;
+
+		  /* tgt lives on the GPU */
+		  if (this->gpu_block) {
+			/* Temp buffer lives on the gpu */
+			if (use_gpu_tmp) {
 				d_A = d_buf + rowidx*tgt_width;
-			} else {
+			} else { /* Temp buffer is on the CPU, but tgt is on GPU, so copy buf to GPU */
+				d_buf = symPACK::gpu_allocator.allocate<T>(ldbuf*src_nrows);
+				upcxx::copy(buf, d_buf, ldbuf*src_nrows).wait();
 				d_A = d_buf + rowidx*tgt_width;
 			}
-			if (this->gpu_block) {
-				d_B = this->_d_nzval + tmpBuffers.src_to_tgt_offset[rowidx] + tgt_offset;
-			} else {
-				dev_ptr d_tgt = symPACK::gpu_allocator.allocate<T>(this->_nnz);
-				upcxx::copy(this->_nzval, d_tgt, this->_nnz).wait();
-				d_B = d_tgt  + tmpBuffers.src_to_tgt_offset[rowidx] + tgt_offset;
-			}
+
+			/* tgt lives on the GPU */
+			d_B = this->_d_nzval + tmpBuffers.src_to_tgt_offset[rowidx] + tgt_offset;
+			
 			cublas::cublas_axpy_wrapper2(tgt_width, T(1.0),
 							symPACK::gpu_allocator.local(d_A), 1,
 							symPACK::gpu_allocator.local(d_B), 1);
-			if (!this->gpu_block) {
-				upcxx::copy(d_B, B, tgt_width).wait();
-			}
 			CUDA_ERROR_CHECK(cudaDeviceSynchronize());
+			T  dummy;
+			upcxx::copy(d_B, &dummy, 1).wait();
+			if (!use_gpu_tmp) {
+				symPACK::gpu_allocator.deallocate(d_buf);
+			}
+
+		  } else if (use_gpu_tmp) { /* tgt is not on GPU, buf temp buf is */
+			
+			logfileptr->OFS()<<d_buf<<std::endl;
+			dev_ptr d_tgt = symPACK::gpu_allocator.allocate<T>(this->_nnz);
+			upcxx::copy(tgt, d_tgt, this->_nnz).wait();
+			d_B = d_tgt + tmpBuffers.src_to_tgt_offset[rowidx] + tgt_offset;
+			
+			d_A = d_buf + rowidx*tgt_width;
+			
+			cublas::cublas_axpy_wrapper2(tgt_width, T(1.0),
+							symPACK::gpu_allocator.local(d_A), 1,
+							symPACK::gpu_allocator.local(d_B), 1);
+			CUDA_ERROR_CHECK(cudaDeviceSynchronize());
+			
+			upcxx::copy(d_tgt, tgt, this->_nnz).wait();
+			/* We're done with everything on the GPU now */
+			symPACK::gpu_allocator.deallocate(d_tgt);
+
 		  } else {
 			  blas::Axpy(tgt_width, T(1.0), A, 1, B, 1);
 		  }
@@ -1409,15 +1444,23 @@ namespace symPACK{
 			  blas::Axpy(tgt_width, T(1.0), A, 1, B, 1);
 #endif   				
                 }
+#ifdef CUDA_MODE
+		if (use_gpu_tmp) {
+			symPACK::gpu_allocator.deallocate(d_buf);
+		}
+#endif
               }
               else {
                 // full sparse case
-		//TODO: could probably get around this by not copying buf back to host, but requires
-		//custom cuda kernel
 #ifdef CUDA_MODE
+		/* tgt has to be on the CPU */
 		if (this->gpu_block) {
-			logfileptr->OFS()<<"Copying to"<<std::endl;
 			upcxx::copy(this->_d_nzval, tgt, this->_nnz).wait();
+		}
+
+		/* So does buf */
+		if (use_gpu_tmp) {
+			upcxx::copy(d_buf, buf, ldbuf*src_nrows).wait();
 		}
 
 #endif	
@@ -1430,8 +1473,13 @@ namespace symPACK{
                   }
                 }
 #ifdef CUDA_MODE
+		/* Deallocate gpu tmp buf now that we've used it */
+		if (use_gpu_tmp) {
+			symPACK::gpu_allocator.deallocate(d_buf);
+		}
+		
+		/* Copy tgt back to gpu if needed */
 		if (this->gpu_block) {
-			logfileptr->OFS()<<"Copying back"<<std::endl;
 			upcxx::copy(tgt, this->_d_nzval, this->_nnz).wait();
 		}
 #endif
