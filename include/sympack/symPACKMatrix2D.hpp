@@ -1384,52 +1384,36 @@ namespace symPACK{
               if (first_pivot_idx==last_pivot_idx) {
                 // Updating contiguous columns
                 rowind_t tgt_offset = (tgt_fc - this->first_col);
+#ifdef CUDA_MODE
+                dev_ptr d_A, d_B, d_tgt;
+
+                /* Need to copy buf to GPU for the axpy */
+                if (!use_gpu_tmp && this->gpu_block) {   
+                    d_buf = symPACK::gpu_allocator.allocate<T>(ldbuf*src_nrows);
+                    upcxx::copy(buf, d_buf, ldbuf*src_nrows).wait();
+                    d_tgt = this->_d_nzval;
+                }
+                
+                /* Need to copy target to GPU for the axpy */
+                if (use_gpu_tmp && !this->gpu_block) {
+                    d_tgt = symPACK::gpu_allocator.allocate<T>(this->_nnz);
+                    upcxx::copy(tgt, d_tgt, this->_nnz).wait();
+                }
+
+#endif
                 for (rowind_t rowidx = 0; rowidx < src_nrows; ++rowidx) {
                  
                   T * A = &buf[rowidx*tgt_width];
                   T * B = &tgt[tmpBuffers.src_to_tgt_offset[rowidx] + tgt_offset];                 
 #ifdef CUDA_MODE
-                  dev_ptr d_A, d_B;
-
-                  /* tgt lives on the GPU */
-                  if (this->gpu_block) {
-                    /* Temp buffer lives on the gpu */
-                    if (use_gpu_tmp) {
-                        d_A = d_buf + rowidx*tgt_width;
-                    } else { /* Temp buffer is on the CPU, but tgt is on GPU, so copy buf to GPU */
-                        d_buf = symPACK::gpu_allocator.allocate<T>(ldbuf*src_nrows);
-                        upcxx::copy(buf, d_buf, ldbuf*src_nrows).wait();
-                        d_A = d_buf + rowidx*tgt_width;
-                    }
-
-                    /* tgt lives on the GPU */
-                    d_B = this->_d_nzval + tmpBuffers.src_to_tgt_offset[rowidx] + tgt_offset;
-                    
-                    cublas::cublas_axpy_wrapper2(tgt_width, T(1.0),
-                                    symPACK::gpu_allocator.local(d_A), 1,
-                                    symPACK::gpu_allocator.local(d_B), 1);
-                    CUDA_ERROR_CHECK(cudaDeviceSynchronize());
-                    if (!use_gpu_tmp) {
-                        symPACK::gpu_allocator.deallocate(d_buf);
-                    }
-
-                  } else if (use_gpu_tmp) { /* tgt is not on GPU, buf temp buf is */
-                    
-                    dev_ptr d_tgt = symPACK::gpu_allocator.allocate<T>(this->_nnz);
-                    upcxx::copy(tgt, d_tgt, this->_nnz).wait();
-                    d_B = d_tgt + tmpBuffers.src_to_tgt_offset[rowidx] + tgt_offset;
-                    
+                  /* tgt or tmpBuf lives on the GPU */
+                  if (this->gpu_block || use_gpu_tmp) {
                     d_A = d_buf + rowidx*tgt_width;
-                    
+                    d_B = d_tgt + tmpBuffers.src_to_tgt_offset[rowidx] + tgt_offset;
                     cublas::cublas_axpy_wrapper2(tgt_width, T(1.0),
                                     symPACK::gpu_allocator.local(d_A), 1,
                                     symPACK::gpu_allocator.local(d_B), 1);
                     CUDA_ERROR_CHECK(cudaDeviceSynchronize());
-                    
-                    upcxx::copy(d_tgt, tgt, this->_nnz).wait();
-                    /* We're done with everything on the GPU now */
-                    symPACK::gpu_allocator.deallocate(d_tgt);
-
                   } else {
                       blas::Axpy(tgt_width, T(1.0), A, 1, B, 1);
                   }
@@ -1438,7 +1422,14 @@ namespace symPACK{
 #endif   				
                 }
 #ifdef CUDA_MODE
-		        if (use_gpu_tmp) {
+                /* Copy back to tgt if it lives on the CPU */
+                if (use_gpu_tmp && !this->gpu_block) {
+                    upcxx::copy(d_tgt, tgt, this->_nnz).wait();
+                    symPACK::gpu_allocator.deallocate(d_tgt);
+                }
+                
+                /* Deallocate tmpBuf if we used it in the GEMM or the axpy*/
+		        if (use_gpu_tmp || this->gpu_block) {
 			      symPACK::gpu_allocator.deallocate(d_buf);
 		        }
 #endif
