@@ -46,7 +46,7 @@
 #define SYRK_CPU_LIMIT 100000
 #define NO_GPU false
 #define AXPY_CPU_LIMIT 100000000
-#define BLOCK_GPU_LIMIT 100000
+#define BLOCK_GPU_LIMIT 100000000
 
 #ifdef _PRIORITY_QUEUE_RDY_
 #define push_ready(sched,ptr) sched->ready_tasks.push(ptr);
@@ -371,7 +371,12 @@ namespace symPACK{
           meta_t in_meta;
           //a pointer to be used by the user if he wants to attach some data
           std::shared_ptr<blockCellBase_t> extra_data;
-	  incoming_data_t():transfered(false),size(0),extra_data(nullptr),landing_zone(nullptr) {
+	  incoming_data_t():transfered(false),size(0),extra_data(nullptr),landing_zone(nullptr)
+#ifdef CUDA_MODE
+         ,d_remote_gptr(nullptr),
+         d_landing_zone(nullptr)
+#endif        
+          {
             on_fetch_future = on_fetch.get_future();
           };
 
@@ -379,26 +384,51 @@ namespace symPACK{
 
           bool transfered;
           upcxx::global_ptr<char> remote_gptr;
+#ifdef CUDA_MODE
+          using dev_ptr = upcxx::global_ptr<char, upcxx::memory_kind::cuda_device>;
+          dev_ptr d_remote_gptr;
+          dev_ptr d_landing_zone;
+#endif
           size_t size;
           char * landing_zone;
 
           void allocate() {
-            if (landing_zone == nullptr) landing_zone = new char[size];
+            if (landing_zone == nullptr) 
+                landing_zone = new char[size];
+#ifdef CUDA_MODE
+            if (d_landing_zone==nullptr)
+                d_landing_zone = symPACK::gpu_allocator.allocate<char>(size);
+#endif
           }
 
           upcxx::future<incoming_data_t *> fetch() {
             if (!transfered) {
               transfered=true;
+#ifdef CUDA_MODE
+              upcxx::when_all(
+                upcxx::rget(remote_gptr,landing_zone,size),
+                /* behold the power of memory kinds */
+                upcxx::copy(d_remote_gptr, d_landing_zone, size)
+              ).then([this]() {
+                        on_fetch.fulfill_result(this);
+                        return;}
+                    );
+#else
               upcxx::rget(remote_gptr,landing_zone,size).then([this]() {
                   on_fetch.fulfill_result(this);
                   return;});
-
+#endif
             }
 	    return on_fetch_future;
           }
 
           ~incoming_data_t() {
-            if (landing_zone) delete [] landing_zone;
+            if (landing_zone) 
+                delete [] landing_zone;
+#ifdef CUDA_MODE
+            if (d_landing_zone)
+                symPACK::gpu_allocator.deallocate(d_landing_zone);
+#endif
           }
 
       };
@@ -666,6 +696,26 @@ namespace symPACK{
           _nnz = nzval_cnt;
           _block_container._nblocks = block_cnt;
         }
+
+#ifdef CUDA_MODE
+    blockCell_t (  int_t i, int_t j, char * ext_storage, dev_ptr remote_d_nzval, 
+                   rowind_t firstcol, rowind_t width, 
+                   size_t nzval_cnt, size_t block_cnt ): blockCell_t() {
+          this->i = i;
+          this->j = j;
+          _own_storage = false;
+          _gstorage = nullptr;
+          _storage = ext_storage;   
+          _d_nzval = remote_d_nzval;          
+
+          _dims = std::make_tuple(width);
+          first_col = firstcol;
+          initialize(nzval_cnt,block_cnt);
+          _nnz = nzval_cnt;
+          _block_container._nblocks = block_cnt;
+        }
+
+#endif
 
         //THIS CONSTRUCTOR IS NEVER CALLED
         blockCell_t (  int_t i, int_t j,upcxx::global_ptr<char> ext_gstorage, rowind_t firstcol, rowind_t width, size_t nzval_cnt, size_t block_cnt ): blockCell_t() {
@@ -1399,6 +1449,10 @@ namespace symPACK{
                     d_tgt = symPACK::gpu_allocator.allocate<T>(this->_nnz);
                     upcxx::copy(tgt, d_tgt, this->_nnz).wait();
                 }
+                
+                if (use_gpu_tmp && this->gpu_block) {
+                    d_tgt = this->_d_nzval;
+                }
 
 #endif
                 for (rowind_t rowidx = 0; rowidx < src_nrows; ++rowidx) {
@@ -1428,7 +1482,7 @@ namespace symPACK{
                     symPACK::gpu_allocator.deallocate(d_tgt);
                 }
                 
-                /* Deallocate tmpBuf if we used it in the GEMM or the axpy*/
+                /* Deallocate tmpBuf if we used it */
 		        if (use_gpu_tmp || this->gpu_block) {
 			      symPACK::gpu_allocator.deallocate(d_buf);
 		        }
