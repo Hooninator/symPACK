@@ -85,14 +85,18 @@ int main(int argc, char **argv)
 
       int n_gpus = upcxx::gpu_default_device::device_n(); 
       logfileptr->OFS()<< "Number of GPUs: " << n_gpus << std::endl;
-    
+            
+      int tasks_per_node = optionsFact.tasks_per_node; 
+      if (tasks_per_node==-1)
+        tasks_per_node = upcxx::rank_n();
+        
       int gpu_id = upcxx::rank_me() % n_gpus;
     
       size_t free, total;
       cudaMemGetInfo(&free, &total);
     
-      size_t alloc_size = (free) / (std::max(upcxx::rank_n(), n_gpus) / n_gpus);
-      if ((std::max(upcxx::rank_n(), n_gpus) / n_gpus)==1) alloc_size=alloc_size/2;
+      size_t alloc_size = (free) / (std::max(tasks_per_node, n_gpus) / n_gpus);
+      if ((std::max(tasks_per_node, n_gpus) / n_gpus)==1) alloc_size=alloc_size/2;
 
       symPACK::gpu_allocator = upcxx::make_gpu_allocator<upcxx::gpu_default_device>(alloc_size); 
       logfileptr->OFS()<<"Reserved " << (alloc_size) << " bytes on device "<<gpu_allocator.device_id()<<std::endl;

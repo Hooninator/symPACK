@@ -46,7 +46,6 @@
 #define SYRK_CPU_LIMIT 100000
 #define NO_GPU false
 #define AXPY_CPU_LIMIT 100000000
-#define BLOCK_GPU_LIMIT 100000
 
 #ifdef _PRIORITY_QUEUE_RDY_
 #define push_ready(sched,ptr) sched->ready_tasks.push(ptr);
@@ -489,15 +488,13 @@ namespace symPACK{
             size_t offset;
             rowind_t first_row;
         };
-#ifdef CUDA_MODE
-	using dev_ptr = upcxx::global_ptr<T, upcxx::memory_kind::cuda_device>;
-	dev_ptr _d_nzval;
-	bool gpu_block;
-#endif 
         //virtual int I() {return i;}
 
 #ifdef SP_THREADS
         std::atomic<bool> in_use;
+#endif
+#ifdef CUDA_MODE
+        using dev_ptr = upcxx::global_ptr<T, upcxx::memory_kind::cuda_device>;
 #endif
         rowind_t first_col;
         std::tuple<rowind_t> _dims;
@@ -620,10 +617,6 @@ namespace symPACK{
 #ifdef SP_THREADS
           in_use(false),
 #endif
-#ifdef CUDA_MODE
-	  _d_nzval(nullptr),
-	  gpu_block(false),
-#endif
           _storage(nullptr),_nzval(nullptr),
 	  _gstorage(nullptr),_nnz(0), _nnz_comm(0), _storage_size(0), _own_storage(true) {}
         bool _own_storage;
@@ -663,13 +656,6 @@ namespace symPACK{
           _dims = std::make_tuple(width);
           first_col = firstcol;
           initialize(nzval_cnt,block_cnt);
-#ifdef CUDA_MODE
-	  if (nzval_cnt > BLOCK_GPU_LIMIT) {
-	  	_d_nzval = symPACK::gpu_allocator.allocate<T>(nzval_cnt);
-		gpu_block = true;
-		upcxx::copy(_nzval, _d_nzval, nzval_cnt).wait(); 
-	  }
-#endif 
           _nnz = nzval_cnt;
           _block_container._nblocks = block_cnt;
         }
@@ -1035,7 +1021,6 @@ namespace symPACK{
 		
 		/* Couldn't allocate enough space on GPU, so use CPU */
 		if (d_diag_nzval==nullptr) {
-			gpu_alloc_err_handler(snode_size*snode_size*sizeof(T));
             		lapack::Potrf( 'U', snode_size, diag_nzval, snode_size);
 		} else {
 			upcxx::copy(diag_nzval, d_diag_nzval, snode_size*snode_size).wait();	
@@ -1080,10 +1065,8 @@ namespace symPACK{
 	  	upcxx::global_ptr<T, upcxx::memory_kind::cuda_device> nzblk_nzval_inter = symPACK::gpu_allocator.allocate<T>(snode_size*total_rows());
 		
 		if (diag_nzval_inter==nullptr) {
-			gpu_alloc_err_handler(snode_size*snode_size*sizeof(T));
           		blas::Trsm('L','U','T','N',snode_size, total_rows(), T(1.0),  diag_nzval, snode_size, nzblk_nzval, snode_size);
 		} else if (nzblk_nzval_inter==nullptr) {
-			gpu_alloc_err_handler(snode_size*total_rows()*sizeof(T));
           		blas::Trsm('L','U','T','N',snode_size, total_rows(), T(1.0),  diag_nzval, snode_size, nzblk_nzval, snode_size);
 		} else {
 
@@ -1226,10 +1209,8 @@ namespace symPACK{
 		dev_ptr d_buf = symPACK::gpu_allocator.allocate<T>(tgt_width * ldbuf);
 		
 		if (d_pivot_nzval==nullptr) {
-		        gpu_alloc_err_handler(tgt_width*src_snode_size);	
 			blas::Syrk('U','T',tgt_width, src_snode_size, T(-1.0), pivot_nzval, src_snode_size, beta, buf, ldbuf);
 		} else if (d_buf==nullptr) { 
-		        gpu_alloc_err_handler(tgt_width*ldbuf);	
 			blas::Syrk('U','T',tgt_width, src_snode_size, T(-1.0), pivot_nzval, src_snode_size, beta, buf, ldbuf);
 		} else {
 			upcxx::when_all(
@@ -1270,17 +1251,14 @@ namespace symPACK{
 			dev_ptr d_facing_nzval = symPACK::gpu_allocator.allocate<T>(src_nrows * src_snode_size);
 			dev_ptr d_buf = symPACK::gpu_allocator.allocate<T>(ldbuf * src_nrows);
 			if (d_pivot_nzval==nullptr) {
-				gpu_alloc_err_handler(tgt_width*src_snode_size);
 				blas::Gemm('T','N',tgt_width, src_nrows,src_snode_size,
                   			T(-1.0),pivot_nzval,src_snode_size,
                   			facing_nzval,src_snode_size,beta,buf,ldbuf);
 			} else if (d_facing_nzval==nullptr) {
-				gpu_alloc_err_handler(src_nrows*src_snode_size);
 				blas::Gemm('T','N',tgt_width, src_nrows,src_snode_size,
                   			T(-1.0),pivot_nzval,src_snode_size,
                   			facing_nzval,src_snode_size,beta,buf,ldbuf);
 			} else if (d_buf==nullptr) { 
-				gpu_alloc_err_handler(src_nrows*ldbuf);
 				blas::Gemm('T','N',tgt_width, src_nrows,src_snode_size,
                   			T(-1.0),pivot_nzval,src_snode_size,
                   			facing_nzval,src_snode_size,beta,buf,ldbuf);
