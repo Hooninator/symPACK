@@ -15,8 +15,6 @@
 #include "cusolverDn.h"
 #endif
 
-#include <omp.h>
-
 //#define _NO_COMPUTATION_
 //#define LOCK_SRC 2
 
@@ -338,7 +336,7 @@ namespace symPACK{
 #ifdef _USE_PROM_RDY_
               in_prom = upcxx::promise<>();
 #endif
-#ifdef _USE_PRM_AVAIL_
+#ifdef _USE_PROM_AVAIL_
               in_avail_prom = upcxx::promise<>();
 #endif
               executed = false;
@@ -576,14 +574,14 @@ namespace symPACK{
               public:
                 typedef const_iterator self_type;
                 typedef block_t value_type;
-                typedef block_t& reference;
-                typedef block_t* pointer;
+                typedef block_t const& reference;
+                typedef block_t const* pointer;
                 typedef int difference_type;
                 typedef std::forward_iterator_tag iterator_category;
                 const_iterator(pointer ptr) : ptr_(ptr) { }
                 self_type operator++() { self_type i = *this; ptr_++; return i; }
                 self_type operator++(int junk) { ptr_++; return *this; }
-                const reference operator*() { return *ptr_; }
+                reference operator*() { return *ptr_; }
                 pointer operator->() { return ptr_; }
                 bool operator==(const self_type& rhs) { return ptr_ == rhs.ptr_; }
                 bool operator!=(const self_type& rhs) { return ptr_ != rhs.ptr_; }
@@ -747,7 +745,7 @@ namespace symPACK{
         }
 
         // Move constructor.  
-        blockCell_t ( const blockCell_t && other ): blockCell_t() {
+        blockCell_t ( blockCell_t && other ): blockCell_t() {
 #ifdef CUDA_MODE
           UPCXX_ASSERT(!other._d_nzval && !other.is_gpu_block, "This function is unimplemented for blocks using host-bypass communication");
 #endif
@@ -815,7 +813,7 @@ namespace symPACK{
         }  
 
         // Move assignment operator.  
-        blockCell_t& operator=(const blockCell_t&& other)  {  
+        blockCell_t& operator=(blockCell_t&& other)  {  
 #ifdef CUDA_MODE
           UPCXX_ASSERT(!other._d_nzval && !other.is_gpu_block, "This function is unimplemented for blocks using host-bypass communication");
 #endif
@@ -1006,7 +1004,7 @@ namespace symPACK{
           }
           if (iscorrect)
             logfileptr->OFS()<<"Buffers are equal"<<std::endl;
-          delete h_actual;
+          delete [] h_actual;
         }
 
         //actual must be a device pointer
@@ -1026,7 +1024,7 @@ namespace symPACK{
           }
           if (iscorrect)
             logfileptr->OFS()<<"Buffers are equal"<<std::endl;
-          delete h_actual;
+          delete [] h_actual;
         }
 #endif
 	
@@ -1096,10 +1094,10 @@ namespace symPACK{
 #else
                 potrf_cpu();
 #endif
-	      }
-            catch(const std::runtime_error& e) {
-                std::cerr << "Runtime error: " << e.what() << '\n';
-                gdb_lock();
+	  }
+          catch(const std::runtime_error& e) {
+            std::cerr << "Runtime error: " << e.what() << '\n';
+            gdb_lock();
           }
           return 0;
         }
@@ -6928,12 +6926,12 @@ namespace symPACK{
 
 #ifdef _USE_PROM_RDY_
               auto fut = ptask->in_prom.finalize();
-              fut.then([this,ptr]() {
+              fut.then([this, ptr]() {
 #ifdef SP_THREADS
-                  if (this->scheduler.extraTaskHandle_!=nullptr) {
-                  bool delay = this->scheduler.extraTaskHandle_(ptr);
+                  if (this->extraTaskHandle_!=nullptr) {
+                  bool delay = this->extraTaskHandle_(ptr);
                   if (delay) {
-                  this->scheduler.delayedTasks_[ptr->_lock_ptr].push_back(ptr);
+                  this->delayedTasks_[ptr->_lock_ptr].push_back(ptr);
                   return;
                   }
                   }
